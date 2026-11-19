@@ -1,0 +1,137 @@
+# =============================================================================
+# PromptEdit assessment - CI/CD
+#
+# CI : on every push / pull request -> composer install, npm build, php artisan test.
+# CD : ONLY via "Run workflow" on main, and only if repo variable DEPLOY_ENABLED == "true".
+#      The app is built in CI (vendor + public/build) and rsynced over SSH to Hostinger.
+#      .env, storage/ and the SQLite file on the server are never overwritten.
+#
+# Secrets : HOSTINGER_SSH_HOST, HOSTINGER_SSH_PORT, HOSTINGER_SSH_USER, HOSTINGER_SSH_KEY,
+#           HOSTINGER_APP_PATH  (app folder OUTSIDE public_html, must contain "promptedit")
+# Variables: DEPLOY_ENABLED=true, PHP_BIN (optional, default "php")
+# No secret lives in this file.
+# =============================================================================
+name: CI/CD
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: ci-cd-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  ci:
+    name: Tests and build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: shivammathur/setup-php@v2
+        with:
+          php-version: "8.2"
+          extensions: mbstring, pdo_sqlite, bcmath, intl
+          coverage: none
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: npm
+
+      - name: Install PHP dependencies
+        run: composer install --no-interaction --prefer-dist --no-progress
+
+      - name: Install JS dependencies and build assets
+        run: |
+          npm ci
+          npm run build
+
+      - name: Run tests
+        run: |
+          cp .env.example .env
+          php artisan key:generate
+          php artisan test
+
+      - name: Package production build
+        if: github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/main'
+        run: |
+          composer install --no-dev --no-interaction --prefer-dist --optimize-autoloader --no-progress
+          rm -f .env
+          tar --exclude=./node_modules --exclude=./.git --exclude=./tests \
+              --exclude=./storage --exclude='./database/*.sqlite' \
+              -czf /tmp/release.tgz .
+          mv /tmp/release.tgz release.tgz
+
+      - name: Upload release
+        if: github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/main'
+        uses: actions/upload-artifact@v4
+        with:
+          name: release
+          path: release.tgz
+          retention-days: 3
+
+  deploy:
+    name: Deploy to Hostinger
+    needs: [ci]
+    if: github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/main' && vars.DEPLOY_ENABLED == 'true'
+    runs-on: ubuntu-latest
+    environment: production
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: release
+
+      - name: SSH setup
+        env:
+          SSH_KEY: ${{ secrets.HOSTINGER_SSH_KEY }}
+          SSH_HOST: ${{ secrets.HOSTINGER_SSH_HOST }}
+          SSH_PORT: ${{ secrets.HOSTINGER_SSH_PORT }}
+        run: |
+          install -m 700 -d ~/.ssh
+          printf '%s\n' "$SSH_KEY" > ~/.ssh/id_deploy
+          chmod 600 ~/.ssh/id_deploy
+          ssh-keyscan -p "${SSH_PORT:-65002}" "$SSH_HOST" >> ~/.ssh/known_hosts
+
+      - name: Upload and release
+        env:
+          SSH_HOST: ${{ secrets.HOSTINGER_SSH_HOST }}
+          SSH_PORT: ${{ secrets.HOSTINGER_SSH_PORT }}
+          SSH_USER: ${{ secrets.HOSTINGER_SSH_USER }}
+          APP: ${{ secrets.HOSTINGER_APP_PATH }}
+          PHP_BIN: ${{ vars.PHP_BIN || 'php' }}
+        run: |
+          set -euo pipefail
+          APP="${APP%/}"
+          case "$APP" in
+            *promptedit*) ;;
+            *) echo "Refusing path without 'promptedit': $APP"; exit 1 ;;
+          esac
+          SSH="ssh -i $HOME/.ssh/id_deploy -p ${SSH_PORT:-65002} $SSH_USER@$SSH_HOST"
+          scp -i ~/.ssh/id_deploy -P "${SSH_PORT:-65002}" release.tgz "$SSH_USER@$SSH_HOST:/tmp/promptedit-release.tgz"
+          $SSH bash -s -- "$APP" "$PHP_BIN" <<'REMOTE'
+          set -euo pipefail
+          APP="$1"; PHP="$2"
+          mkdir -p "$APP"
+          cd "$APP"
+          [ -f artisan ] && $PHP artisan down --retry=15 || true
+          tar -xzf /tmp/promptedit-release.tgz -C "$APP"
+          rm -f /tmp/promptedit-release.tgz
+          mkdir -p storage/app/public storage/framework/{cache,sessions,views} storage/logs bootstrap/cache
+          if [ ! -f .env ]; then echo "Missing $APP/.env - create it once on the server"; $PHP artisan up || true; exit 1; fi
+          $PHP artisan migrate --force
+          $PHP artisan optimize:clear
+          $PHP artisan config:cache
+          $PHP artisan route:cache
+          $PHP artisan view:cache
+          $PHP artisan queue:restart || true
+          $PHP artisan up
+          REMOTE
+
+      - name: Cleanup key
+        if: always()
+        run: rm -f ~/.ssh/id_deploy
